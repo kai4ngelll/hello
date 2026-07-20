@@ -819,6 +819,15 @@
     return sum / (w*h);
   }
 
+  function estimateYaw(lm) {
+    // Насколько нос смещён от центра между внешними уголками глаз — прокси разворота головы.
+    const noseX = lm[30].x;
+    const eyeLOuterX = lm[36].x, eyeROuterX = lm[45].x;
+    const center = (eyeLOuterX + eyeROuterX) / 2;
+    const halfWidth = Math.abs(eyeROuterX - eyeLOuterX) / 2 || 1;
+    return (noseX - center) / halfWidth; // ~0 = анфас, |yaw| растёт при повороте
+  }
+
   function checkFringeOcclusion(lm) {
     const browY = avgY(lm.slice(17, 27));
     const eyeY = avgY(lm.slice(36, 48));
@@ -933,14 +942,6 @@
 
     let skinScore = estimateSkinScoreWithTable(img, box, lm, gender);
 
-    const BONUS = 1.5;
-    thirdsScore = Math.min(10, thirdsScore + BONUS);
-    jawScore = Math.min(10, jawScore + BONUS);
-    spacingScore = Math.min(10, spacingScore + BONUS);
-    noseScore = Math.min(10, noseScore + BONUS);
-    lipScore = Math.min(10, lipScore + BONUS);
-    skinScore = Math.min(10, skinScore + BONUS);
-
     const traits = [
       { key: 'thirds', name: 'Пропорции трети лица', score: thirdsScore, note: 'Баланс средней и нижней трети (нос–рот–подбородок).' },
       { key: 'jaw', name: gender === 'm' ? 'Выраженность челюсти' : 'Форма нижней трети', score: jawScore, note: 'Ширина челюсти относительно ширины лица.' },
@@ -1008,6 +1009,11 @@
       return { ok: false, reason: 'Похоже, чёлка или волосы закрывают брови/глаза. Нужно фото с открытым лбом и глазами.' };
     }
 
+    const yaw = estimateYaw(landmarks);
+    if (Math.abs(yaw) > 0.38) {
+      return { ok: false, reason: 'Лицо повёрнуто в сторону. Нужен анфас — смотрите прямо в камеру.' };
+    }
+
     const detectedGender = det.gender === 'male' ? 'm' : 'f';
     const confidence = det.genderProbability;
     if (detectedGender !== selectedGender && confidence >= 0.75) {
@@ -1017,7 +1023,15 @@
       };
     }
 
-    return { ok: true, landmarks, box };
+    // Индекс качества фото 0..1 — используется как вес при усреднении нескольких снимков:
+    // чёткие, ровно освещённые, анфасные фото с уверенным детектом влияют на итог сильнее.
+    const sharpNorm = Math.max(0, Math.min(1, (blur - 7) / 33));
+    const brightNorm = Math.max(0, 1 - Math.abs(brightness - 130) / 110);
+    const frontalNorm = Math.max(0, 1 - Math.abs(yaw) / 0.38);
+    const detNorm = Math.max(0, Math.min(1, det.detection.score || 0.7));
+    const quality = 0.15 + 0.85 * (sharpNorm * 0.3 + brightNorm * 0.2 + frontalNorm * 0.3 + detNorm * 0.2);
+
+    return { ok: true, landmarks, box, quality };
   }
 
   function loadImageEl(dataUrl) {
@@ -1110,17 +1124,23 @@
     const rank = result.rank;
     const rankColor = result.overall >= 7.5 ? 'high' : result.overall >= 5.5 ? 'mid' : 'low';
 
+    const perPhotoHtml = (result.perPhoto && result.perPhoto.length > 1) ? `
+      <div class="per-photo-note" style="font-family:var(--mono);font-size:10.5px;color:var(--g-400);letter-spacing:0.03em;margin:2px 0 12px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.07);display:flex;flex-wrap:wrap;gap:8px;">
+        ${result.perPhoto.map(p => `<span>Фото ${p.index}: ${p.overall.toFixed(1)}</span>`).join('')}
+      </div>` : '';
+
     wrap.innerHTML = `
       <div class="bubble">
         <div class="verdict">
           <div class="score-row">
             <span class="score">${result.overall.toFixed(1)}</span>
             <span class="score-max">/ 10</span>
-            <span class="score-label">общий балл</span>
+            <span class="score-label">общий балл${result.perPhoto && result.perPhoto.length > 1 ? ` · по ${result.perPhoto.length} фото` : ''}</span>
             <span class="rank-badge ${rankColor}">${rank.emoji} ${rank.label}</span>
           </div>
+          ${perPhotoHtml}
           ${traitsHtml}
-          <div class="approx-note">Геометрический анализ по фото. Оценка кожи — грубая эвристика по текстуре, не диагностика.</div>
+          <div class="approx-note">Геометрический анализ по фото${result.perPhoto && result.perPhoto.length > 1 ? ' (взвешенное среднее по чёткости, освещению и развороту каждого снимка)' : ''}. Оценка кожи — грубая эвристика по текстуре, не диагностика.</div>
         </div>
       </div>
       <span class="meta">ОЦЕНКА · ${timeNow()}</span>`;
@@ -1207,6 +1227,7 @@
           break;
         }
         const result = scoreFace(quality.landmarks, quality.box, img, gender);
+        result.photoQuality = quality.quality;
         allResults.push(result);
       } catch (err) {
         allOk = false;
@@ -1240,14 +1261,19 @@
       skin: 'Грубая оценка текстуры по фото, не диагностика.'
     };
 
+    // Взвешенное усреднение по фото: более чёткие, ровно освещённые, анфасные снимки
+    // с уверенным детектом лица вносят больший вклад в итоговую оценку.
+    const qSum = allResults.reduce((s, r) => s + (r.photoQuality || 0.5), 0) || 1;
+
     const avgTraits = {};
     traitKeys.forEach(key => {
       let sum = 0;
       allResults.forEach(r => {
         const t = r.traits.find(tr => tr.key === key);
-        if (t) sum += t.score;
+        const w = r.photoQuality || 0.5;
+        if (t) sum += t.score * w;
       });
-      avgTraits[key] = sum / allResults.length;
+      avgTraits[key] = sum / qSum;
     });
 
     const weights = { thirds: 0.18, jaw: 0.20, spacing: 0.15, nose: 0.15, lips: 0.17, skin: 0.15 };
@@ -1265,9 +1291,16 @@
       note: traitNotes[key]
     }));
 
+    // Отдельный общий балл по каждому фото — чтобы показать, что каждое проанализировано индивидуально.
+    const perPhoto = allResults.map((r, i) => ({
+      index: i + 1,
+      overall: r.overall,
+      quality: r.photoQuality || 0.5
+    }));
+
     const rank = getRank(overall, gender);
 
-    addVerdict({ overall, traits: finalTraits, rank }, photoForEmail);
+    addVerdict({ overall, traits: finalTraits, rank, perPhoto }, photoForEmail);
   });
 </script>
 </body>
