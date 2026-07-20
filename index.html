@@ -820,12 +820,21 @@
   }
 
   function estimateYaw(lm) {
-    // Насколько нос смещён от центра между внешними уголками глаз — прокси разворота головы.
-    const noseX = lm[30].x;
-    const eyeLOuterX = lm[36].x, eyeROuterX = lm[45].x;
-    const center = (eyeLOuterX + eyeROuterX) / 2;
-    const halfWidth = Math.abs(eyeROuterX - eyeLOuterX) / 2 || 1;
-    return (noseX - center) / halfWidth; // ~0 = анфас, |yaw| растёт при повороте
+    // Сначала убираем наклон головы (roll) по линии глаз, чтобы не путать его
+    // с реальным поворотом лица от камеры (yaw). Иначе лёгкий наклон вбок
+    // ложно засчитывался бы как "лицо не анфас".
+    const eyeLOuter = lm[36], eyeROuter = lm[45];
+    const roll = Math.atan2(eyeROuter.y - eyeLOuter.y, eyeROuter.x - eyeLOuter.x);
+    const cos = Math.cos(-roll), sin = Math.sin(-roll);
+
+    const cx = (eyeLOuter.x + eyeROuter.x) / 2;
+    const cy = (eyeLOuter.y + eyeROuter.y) / 2;
+
+    const noseDx = lm[30].x - cx, noseDy = lm[30].y - cy;
+    const rotatedNoseX = noseDx * cos - noseDy * sin;
+
+    const halfWidth = Math.hypot(eyeROuter.x - eyeLOuter.x, eyeROuter.y - eyeLOuter.y) / 2 || 1;
+    return rotatedNoseX / halfWidth; // ~0 = анфас, растёт только при реальном повороте, не при наклоне
   }
 
   function checkFringeOcclusion(lm) {
@@ -1010,7 +1019,7 @@
     }
 
     const yaw = estimateYaw(landmarks);
-    if (Math.abs(yaw) > 0.38) {
+    if (Math.abs(yaw) > 0.45) {
       return { ok: false, reason: 'Лицо повёрнуто в сторону. Нужен анфас — смотрите прямо в камеру.' };
     }
 
@@ -1027,7 +1036,7 @@
     // чёткие, ровно освещённые, анфасные фото с уверенным детектом влияют на итог сильнее.
     const sharpNorm = Math.max(0, Math.min(1, (blur - 7) / 33));
     const brightNorm = Math.max(0, 1 - Math.abs(brightness - 130) / 110);
-    const frontalNorm = Math.max(0, 1 - Math.abs(yaw) / 0.38);
+    const frontalNorm = Math.max(0, 1 - Math.abs(yaw) / 0.45);
     const detNorm = Math.max(0, Math.min(1, det.detection.score || 0.7));
     const quality = 0.15 + 0.85 * (sharpNorm * 0.3 + brightNorm * 0.2 + frontalNorm * 0.3 + detNorm * 0.2);
 
